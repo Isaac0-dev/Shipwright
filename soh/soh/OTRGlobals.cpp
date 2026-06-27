@@ -1794,11 +1794,42 @@ void RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>
     UIWidgets::Colors themeColor =
         static_cast<UIWidgets::Colors>(CVarGetInteger(CVAR_SETTING("Menu.Theme"), UIWidgets::Colors::LightBlue));
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, UIWidgets::ColorValues.at(themeColor));
-    for (const auto& m : mtx_replacements) {
-        wnd->DrawAndRunGraphicsCommands(Commands, m);
+
+    // Frame pacing: track the expected start of each game frame.
+    // If rendering interpolated frames takes too long, skip them
+    // to keep game logic running at its intended rate.
+    static uint64_t sFrameStartTicks = 0;
+    uint64_t freq = GetFrequency();
+    int originalFps = 60 / R_UPDATE_RATE;
+    uint64_t frameTicks = (uint64_t)((double)freq / (double)originalFps);
+
+    if (sFrameStartTicks == 0) {
+        sFrameStartTicks = GetPerfCounter();
+    }
+
+    uint64_t targetEndTicks = sFrameStartTicks + frameTicks;
+
+    for (size_t i = 0; i < mtx_replacements.size(); i++) {
+        if (i < mtx_replacements.size() - 1 && GetPerfCounter() >= targetEndTicks) {
+            // Out of time budget — skip remaining interpolated frames,
+            // jump directly to the final (game) frame.
+            i = mtx_replacements.size() - 1;
+            intp->mInterpolationIndex = (int32_t)i;
+        }
+        wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements[i]);
         intp->mInterpolationIndex++;
     }
+
     ImGui::PopStyleColor();
+
+    // Advance the frame start clock for the next call.
+    uint64_t now = GetPerfCounter();
+    if (now > sFrameStartTicks + 2 * frameTicks) {
+        // Too far behind — reset to avoid spiralling.
+        sFrameStartTicks = now;
+    } else {
+        sFrameStartTicks += frameTicks;
+    }
 }
 
 // C->C++ Bridge

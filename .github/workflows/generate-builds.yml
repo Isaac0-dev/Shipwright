@@ -267,3 +267,151 @@ jobs:
       with:
         key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
         path: vcpkg
+
+  build-wiiu:
+    needs: generate-soh-otr
+    runs-on: ubuntu-22.04
+    container:
+      image: devkitpro/devkitppc:20260503
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: true
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y ninja-build libpng-dev zlib1g-dev libbz2-dev cmake
+
+        # Cross-compile libzip for Wii U
+        wget https://libzip.org/download/libzip-1.10.1.tar.gz -O /tmp/libzip.tar.gz
+        tar -xzf /tmp/libzip.tar.gz -C /tmp
+        cd /tmp/libzip-1.10.1
+        mkdir build && cd build
+        cmake .. -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/WiiU.cmake -DBUILD_SHARED_LIBS=OFF -DBUILD_TOOLS=OFF -DBUILD_REGRESS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_DOC=OFF -DENABLE_ZSTD=OFF -DCMAKE_INSTALL_PREFIX=/opt/devkitpro/portlibs/wiiu
+        make -j$(nproc)
+        make install
+        cd $GITHUB_WORKSPACE
+
+        # Cross-compile tinyxml2 for Wii U
+        wget https://github.com/leethomason/tinyxml2/archive/refs/tags/10.0.0.tar.gz -O /tmp/tinyxml2.tar.gz
+        tar -xzf /tmp/tinyxml2.tar.gz -C /tmp
+        cd /tmp/tinyxml2-10.0.0
+        mkdir build && cd build
+        cmake .. -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/WiiU.cmake -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_PREFIX=/opt/devkitpro/portlibs/wiiu
+        make -j$(nproc)
+        make install
+        cd $GITHUB_WORKSPACE
+
+        # nlohmann-json (header-only, just need cmake config)
+        wget https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz -O /tmp/json.tar.gz
+        tar -xzf /tmp/json.tar.gz -C /tmp
+        cd /tmp/json-3.11.3
+        cmake -Bbuild -DCMAKE_INSTALL_PREFIX=/opt/devkitpro/portlibs/wiiu -DJSON_BuildTests=OFF
+        cmake --build build --target install
+        cd $GITHUB_WORKSPACE
+
+        # spdlog (header-only, create cmake find module)
+        wget https://github.com/gabime/spdlog/archive/refs/tags/v1.15.3.tar.gz -O /tmp/spdlog.tar.gz
+        tar -xzf /tmp/spdlog.tar.gz -C /tmp
+        mkdir -p cmake-stubs
+        echo 'add_library(spdlog::spdlog INTERFACE IMPORTED)' > cmake-stubs/Findspdlog.cmake
+        echo 'target_include_directories(spdlog::spdlog INTERFACE "/tmp/spdlog-1.15.3/include")' >> cmake-stubs/Findspdlog.cmake
+        echo 'set(spdlog_FOUND TRUE)' >> cmake-stubs/Findspdlog.cmake
+
+    - name: Apply Wii U build patches
+      run: |
+        sed -i 's|if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")|if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "CafeOS")|' libultraship/src/CMakeLists.txt
+
+        sed -i '/target_sources(ImGui/{n;n;s|${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp||}' libultraship/cmake/dependencies/common.cmake
+
+        sed -i 's|target_include_directories(ImGui PUBLIC.*|target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE "${DEVKITPRO}/portlibs/wiiu/include" "${DEVKITPRO}/portlibs/wiiu/include/SDL2")|' libultraship/cmake/dependencies/common.cmake
+
+        # Fix filter paths and add CafeOS exclusion for SDL2/OpenGL backends
+        sed -i 's|graphic/Fast3D/backends/|backends/|g' libultraship/src/fast/CMakeLists.txt
+        sed -i '/^source_group("graphic"/i\if (CMAKE_SYSTEM_NAME STREQUAL "CafeOS")\n    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_sdl2*")\n    list(FILTER Source_Files__Graphic EXCLUDE REGEX "backends/gfx_opengl*")\nendif()' libultraship/src/fast/CMakeLists.txt
+
+        # stb_image_free not visible on CafeOS (likely include path conflict); replace with equivalent free()
+        sed -i '1i #include <cstdlib>' libultraship/src/ship/window/gui/resource/GuiTexture.cpp
+        sed -i 's|stbi_image_free|free|g' libultraship/src/ship/window/gui/resource/GuiTexture.cpp
+
+        # SDLAxisDirectionToButtonMapping has an incorrect __WIIU__ include guard; header is purely SDL2-based and SDL2 is available on CafeOS
+        sed -i '/#ifndef __WIIU__/{N;N;s|#ifndef __WIIU__\n#include <ship/controller/controldevice/controller/mapping/sdl/SDLAxisDirectionToButtonMapping.h>\n#endif|#include <ship/controller/controldevice/controller/mapping/sdl/SDLAxisDirectionToButtonMapping.h>|}' soh/soh/Enhancements/controls/SohInputEditorWindow.cpp
+
+        # devkitPPC system headers define 'quad' as a macro (-> quad_t); use post-expansion member name
+        sed -i 's|->dim\.quad\[|->dim.quad_t[|g' soh/soh/Enhancements/debugger/colViewer.cpp
+
+        # OSFatal requires a message argument (WUT API); the stub is missing
+        sed -i 's|OSFatal();|OSFatal("Fatal error");|' soh/soh/OTRGlobals.cpp
+
+        # Extractor include was guarded out but the usage is not; remove the guard
+        sed -i '/^#if not defined(__SWITCH__) && not defined(__WIIU__)$/,/^#endif$/c\#include "Extractor/Extract.h"' soh/soh/OTRGlobals.cpp
+
+        # Init takes const char* but appShortName is std::string
+        sed -i 's|Ship::WiiU::Init(appShortName);|Ship::WiiU::Init(appShortName.c_str());|' soh/soh/OTRGlobals.cpp
+
+        # copy_file needs std::filesystem:: qualifier on GCC 16 (devkitPPC)
+        sed -i 's|copy_file(fileName.c_str(), newFileName.c_str());|std::filesystem::copy_file(fileName.c_str(), newFileName.c_str());|' soh/soh/SaveManager.cpp
+
+        # Opus/opusfile not in devkitPPC sysroot; wrap opus decoder in #ifndef __WIIU__
+        sed -i '/^#include <opus\/opus.h>/i#ifndef __WIIU__' soh/soh/mixer.c
+        sed -i '/^void aOPUSFree/,/^}/{s|^}$|}\n#endif /* !__WIIU__ */|}' soh/soh/mixer.c
+
+        # No OpenGL on CafeOS; remove ENABLE_OPENGL define from libultraship
+        sed -i 's/ENABLE_OPENGL//' libultraship/src/CMakeLists.txt
+        # ImGui_ImplSDL2.h is behind ENABLE_OPENGL but its functions used unconditionally; add it outside the guard
+        sed -i '/^#ifdef ENABLE_OPENGL$/i\#include <imgui_impl_sdl2.h>' libultraship/src/fast/Fast3dGui.cpp
+    - name: Configure ccache
+      uses: hendrikmuhs/ccache-action@v1.2.23
+      with:
+        save: ${{ github.ref_name == github.event.repository.default_branch }}
+        key: ${{ runner.os }}-wiiu-ccache-${{ github.ref }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-wiiu-ccache-${{ github.ref }}
+          ${{ runner.os }}-wiiu-ccache
+
+    - name: Download soh.o2r
+      uses: actions/download-artifact@v8
+      with:
+        name: soh.o2r
+
+    - name: Build SoH
+      run: |
+        # TLS-disabling defines needed for all targets (elf2rpl doesn't support TLS relocations)
+        mkdir -p cmake-stubs
+        cat > cmake-stubs/extra_defs.cmake << 'EOF'
+        if(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
+          add_compile_definitions(STBI_NO_THREAD_LOCALS)
+          add_compile_definitions(SPDLOG_NO_TLS)
+          add_compile_definitions(SPDLOG_NO_THREAD_ID)
+          # Replace C++ thread_local keyword with nothing (elf2rpl doesn't support TLS relocations)
+          set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Dthread_local=")
+        endif()
+        EOF
+        cmake -S . -B build-wiiu -G Ninja \
+          -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/WiiU.cmake \
+          -DCMAKE_BUILD_TYPE:STRING=Release \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -Dnlohmann_json_DIR="/opt/devkitpro/portlibs/wiiu/share/cmake/nlohmann_json" \
+          -DCMAKE_MODULE_PATH="${PWD}/cmake-stubs" \
+          -DCMAKE_PROJECT_INCLUDE="${PWD}/cmake-stubs/extra_defs.cmake"
+        cmake --build build-wiiu --target soh_wuhb --config Release -j3
+        cmake --build build-wiiu --target soh_wuhb --config Release -j3
+
+        mv build-wiiu/soh/*.rpx soh.rpx 2>/dev/null || true
+        mv build-wiiu/soh/*.wuhb soh.wuhb 2>/dev/null || true
+        mv README.md readme.txt 2>/dev/null || true
+      env:
+        DEVKITPRO: /opt/devkitpro
+        DEVKITPPC: /opt/devkitpro/devkitPPC
+
+    - name: Upload build
+      uses: actions/upload-artifact@v7
+      with:
+        name: soh-wiiu
+        path: |
+          soh.rpx
+          soh.wuhb
+          soh.o2r
+          readme.txt
